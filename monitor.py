@@ -107,6 +107,43 @@ async def fetch_movies() -> list[dict]:
         movies.append({"slug": slug, "title": title, "status": status, "genres": genres})
     return movies
 
+async def cmd_debug(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text("⏳ fetching...")
+    try:
+        html = await fetch_html_js(f"{BASE_URL}/movies")
+        soup = BeautifulSoup(html, "html.parser")
+        
+        # check 1: poster wraps
+        wraps = soup.select('div[data-testid="poster-preview-wrap"]')
+        
+        # check 2: any articles
+        articles = soup.find_all("article")
+        
+        # check 3: any movie links
+        links = soup.select('a[href^="/movies/"]')
+        
+        # check 4: page title
+        title = soup.select_one("title")
+        
+        # check 5: html length
+        html_len = len(html)
+        
+        info = (
+            f"HTML size: {html_len} bytes\n"
+            f"Title: {title.get_text() if title else 'none'}\n"
+            f"poster-preview-wrap: {len(wraps)}\n"
+            f"articles: {len(articles)}\n"
+            f"movie links: {len(links)}\n"
+            f"First link: {links[0]['href'] if links else 'none'}\n"
+            f"First wrap classes: {wraps[0].get('class') if wraps else 'none'}"
+        )
+        await msg.edit_text(f"```\n{info}\n```", parse_mode="Markdown")
+    except Exception as e:
+        await msg.edit_text(f"❌ {e}")
+
+# main() এ যোগ করো:
+app.add_handler(CommandHandler("debug", cmd_debug))
+
 def _parse_showtime_page(html: str, halls: list[str]) -> tuple[bool, str]:
     soup    = BeautifulSoup(html, "html.parser")
     section = soup.select_one("#showtimes")
