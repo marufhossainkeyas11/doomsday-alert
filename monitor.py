@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from playwright_stealth import stealth_async
 
 import httpx
 from bs4 import BeautifulSoup
@@ -69,15 +70,18 @@ async def get_context() -> BrowserContext:
         return _context
 
 
+
 async def fetch_html_js(url: str) -> str:
-    """For pages where content is JS-rendered (showtime section)."""
     ctx  = await get_context()
     page = await ctx.new_page()
+    await stealth_async(page)  # এই line যোগ করো
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
-        # wait for showtime section or 5s max
         try:
-            await page.wait_for_selector("#showtimes, .stub", timeout=5_000)
+            await page.wait_for_selector(
+                'div[data-testid="poster-preview-wrap"], #showtimes, .stub',
+                timeout=8_000,
+            )
         except Exception:
             pass
         return await page.content()
@@ -546,4 +550,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main()p
