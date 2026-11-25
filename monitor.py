@@ -4,7 +4,7 @@ import hashlib
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-from curl_cffi.requests import AsyncSession
+import nodriver as uc
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -16,38 +16,48 @@ from telegram.ext import (
 TG_TOKEN    = os.environ["TG_TOKEN"]
 BASE_URL    = "https://starcineplex.com"
 CHECK_EVERY = 60
-IMPERSONATE = "chrome131"
 
 DEFAULT_HALLS: list[str] = []
 
 active_alerts: dict[str, dict[int, dict]] = {}
 alert_lock = asyncio.Lock()
 
-PICK_MOVIE, PICK_HALL = range(2)
+_browser: uc.Browser | None = None
+_browser_lock = asyncio.Lock()
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-}
+PICK_MOVIE, PICK_HALL = range(2)
 # ─────────────────────────────────────────────────────────────────
 
 
+async def get_browser() -> uc.Browser:
+    global _browser
+    async with _browser_lock:
+        if _browser is None:
+            _browser = await uc.start(
+                headless=True,
+                browser_args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+        return _browser
+
+
 async def fetch_html(url: str) -> str:
-    async with AsyncSession(impersonate=IMPERSONATE) as session:
-        r = await session.get(url, headers=HEADERS, timeout=25)
-        r.raise_for_status()
-        return r.text
+    browser = await get_browser()
+    tab = await browser.get(url)
+    # CF challenge solve হওয়ার জন্য অপেক্ষা
+    await asyncio.sleep(3)
+    # CF থাকলে আরেকটু wait
+    for _ in range(10):
+        content = await tab.get_content()
+        if "Just a moment" not in content:
+            break
+        await asyncio.sleep(2)
+    content = await tab.get_content()
+    await tab.close()
+    return content
 
 
 # ─── Scraping ────────────────────────────────────────────────────
