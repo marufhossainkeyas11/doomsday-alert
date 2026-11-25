@@ -4,7 +4,7 @@ import hashlib
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-import nodriver as uc
+from rebrowser_playwright.async_api import async_playwright, Browser, BrowserContext
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -22,60 +22,60 @@ DEFAULT_HALLS: list[str] = []
 active_alerts: dict[str, dict[int, dict]] = {}
 alert_lock = asyncio.Lock()
 
-_browser: uc.Browser | None = None
-_browser_lock = asyncio.Lock()
+_browser: Browser | None = None
+_context: BrowserContext | None = None
+_pw_lock  = asyncio.Lock()
 
 PICK_MOVIE, PICK_HALL = range(2)
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 # ─────────────────────────────────────────────────────────────────
 
 
-def _find_chromium() -> str:
-    import shutil
-    for candidate in (
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        shutil.which("chromium-browser"),
-        shutil.which("chromium"),
-        shutil.which("google-chrome"),
-    ):
-        if candidate and os.path.isfile(candidate):
-            return candidate
-    raise RuntimeError("Chrome/Chromium binary not found")
-
-
-async def get_browser() -> uc.Browser:
-    global _browser
-    async with _browser_lock:
-        if _browser is None:
-            _browser = await uc.start(
+async def get_context() -> BrowserContext:
+    global _browser, _context
+    async with _pw_lock:
+        if _context is None:
+            pw = await async_playwright().start()
+            _browser = await pw.chromium.launch(
                 headless=True,
-                browser_executable_path=_find_chromium(),
-                browser_args=[
+                args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
-                    "--single-process",
+                    "--disable-blink-features=AutomationControlled",
                 ],
             )
-        return _browser
+            _context = await _browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=HEADERS["User-Agent"],
+                locale="en-US",
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            )
+        return _context
 
 
 async def fetch_html(url: str) -> str:
-    browser = await get_browser()
-    tab = await browser.get(url)
-    # CF challenge solve হওয়ার জন্য অপেক্ষা
-    await asyncio.sleep(3)
-    # CF থাকলে আরেকটু wait
-    for _ in range(10):
-        content = await tab.get_content()
-        if "Just a moment" not in content:
-            break
-        await asyncio.sleep(2)
-    content = await tab.get_content()
-    await tab.close()
-    return content
+    ctx  = await get_context()
+    page = await ctx.new_page()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        # CF challenge solve হওয়ার জন্য wait
+        for _ in range(15):
+            content = await page.content()
+            if "Just a moment" not in content and len(content) > 10_000:
+                break
+            await asyncio.sleep(2)
+        return await page.content()
+    finally:
+        await page.close()
 
 
 # ─── Scraping ────────────────────────────────────────────────────
@@ -104,24 +104,25 @@ async def fetch_movies() -> list[dict]:
 async def cmd_debug(update: Update, _: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ fetching...")
     try:
-        # chrome path check
-        import shutil, glob
-        candidates = [
-            "/usr/bin/chromium-browser",
-            "/usr/bin/chromium",
-            "/usr/bin/google-chrome",
-            "/usr/bin/google-chrome-stable",
-            "/usr/local/bin/chromium",
-            shutil.which("chromium-browser"),
-            shutil.which("chromium"),
-            shutil.which("google-chrome"),
-        ]
-        found = [c for c in candidates if c and os.path.isfile(c)]
-        # glob search
-        glob_hits = glob.glob("/usr/**/chrom*", recursive=True)[:5]
+        html = await fetch_html(f"{BASE_URL}/movies")
+        soup = BeautifulSoup(html, "html.parser")
 
-        chrome_info = f"Found: {found}\nGlob: {glob_hits}"
-        await msg.edit_text(f"```\n{chrome_info}\n```", parse_mode="Markdown")
+        wraps    = soup.select('div[data-testid="poster-preview-wrap"]')
+        articles = soup.find_all("article")
+        links    = soup.select('a[href^="/movies/"]')
+        title    = soup.select_one("title")
+        html_len = len(html)
+
+        info = (
+            f"HTML size: {html_len} bytes\n"
+            f"Title: {title.get_text() if title else 'none'}\n"
+            f"poster-preview-wrap: {len(wraps)}\n"
+            f"articles: {len(articles)}\n"
+            f"movie links: {len(links)}\n"
+            f"First link: {links[0]['href'] if links else 'none'}\n"
+            f"First wrap classes: {wraps[0].get('class') if wraps else 'none'}"
+        )
+        await msg.edit_text(f"```\n{info}\n```", parse_mode="Markdown")
     except Exception as e:
         await msg.edit_text(f"❌ {e}")
 
