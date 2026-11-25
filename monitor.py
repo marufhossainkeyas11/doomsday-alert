@@ -104,25 +104,24 @@ async def fetch_movies() -> list[dict]:
 async def cmd_debug(update: Update, _: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ fetching...")
     try:
-        html = await fetch_html(f"{BASE_URL}/movies")
-        soup = BeautifulSoup(html, "html.parser")
+        # chrome path check
+        import shutil, glob
+        candidates = [
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/local/bin/chromium",
+            shutil.which("chromium-browser"),
+            shutil.which("chromium"),
+            shutil.which("google-chrome"),
+        ]
+        found = [c for c in candidates if c and os.path.isfile(c)]
+        # glob search
+        glob_hits = glob.glob("/usr/**/chrom*", recursive=True)[:5]
 
-        wraps    = soup.select('div[data-testid="poster-preview-wrap"]')
-        articles = soup.find_all("article")
-        links    = soup.select('a[href^="/movies/"]')
-        title    = soup.select_one("title")
-        html_len = len(html)
-
-        info = (
-            f"HTML size: {html_len} bytes\n"
-            f"Title: {title.get_text() if title else 'none'}\n"
-            f"poster-preview-wrap: {len(wraps)}\n"
-            f"articles: {len(articles)}\n"
-            f"movie links: {len(links)}\n"
-            f"First link: {links[0]['href'] if links else 'none'}\n"
-            f"First wrap classes: {wraps[0].get('class') if wraps else 'none'}"
-        )
-        await msg.edit_text(f"```\n{info}\n```", parse_mode="Markdown")
+        chrome_info = f"Found: {found}\nGlob: {glob_hits}"
+        await msg.edit_text(f"```\n{chrome_info}\n```", parse_mode="Markdown")
     except Exception as e:
         await msg.edit_text(f"❌ {e}")
 
