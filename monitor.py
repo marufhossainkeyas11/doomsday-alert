@@ -141,9 +141,6 @@ async def cmd_debug(update: Update, _: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"❌ {e}")
 
-# main() এ যোগ করো:
-app.add_handler(CommandHandler("debug", cmd_debug))
-
 def _parse_showtime_page(html: str, halls: list[str]) -> tuple[bool, str]:
     soup    = BeautifulSoup(html, "html.parser")
     section = soup.select_one("#showtimes")
@@ -536,9 +533,10 @@ def main():
     app.add_handler(CommandHandler("alerts",  cmd_alerts))
     app.add_handler(CommandHandler("cancel",  cmd_cancel_cmd))
     app.add_handler(CommandHandler("check",   cmd_check))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CallbackQueryHandler(cb_quickalert, pattern=r"^quickalert:"))
     app.add_handler(CallbackQueryHandler(cb_cancel,     pattern=r"^cancel:"))
-
+    
     async def post_init(application: Application):
         asyncio.create_task(polling_loop(application))
 
