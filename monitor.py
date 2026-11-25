@@ -4,6 +4,7 @@ import hashlib
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, Browser, BrowserContext
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -15,11 +16,10 @@ from telegram.ext import (
 # ─── CONFIG ──────────────────────────────────────────────────────
 TG_TOKEN    = os.environ["TG_TOKEN"]
 BASE_URL    = "https://starcineplex.com"
-CHECK_EVERY = 60  # seconds between polling ticks
+CHECK_EVERY = 60
 
-DEFAULT_HALLS: list[str] = []  # empty = any hall
+DEFAULT_HALLS: list[str] = []
 
-# slug → {chat_id → {"hash": str, "halls": list[str]}}
 active_alerts: dict[str, dict[int, dict]] = {}
 alert_lock = asyncio.Lock()
 
@@ -27,12 +27,29 @@ _browser: Browser | None = None
 _context: BrowserContext | None = None
 _pw_lock  = asyncio.Lock()
 
-# ConversationHandler states
 PICK_MOVIE, PICK_HALL = range(2)
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 # ─────────────────────────────────────────────────────────────────
 
 
-# ─── Playwright ──────────────────────────────────────────────────
+# ─── HTTP (movies page — SSR, no JS needed) ──────────────────────
+
+async def fetch_html_static(url: str) -> str:
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=20) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        return r.text
+
+
+# ─── Playwright (showtime page — JS-rendered) ────────────────────
 
 async def get_context() -> BrowserContext:
     global _browser, _context
@@ -45,22 +62,24 @@ async def get_context() -> BrowserContext:
             )
             _context = await _browser.new_context(
                 viewport={"width": 1280, "height": 800},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
+                user_agent=HEADERS["User-Agent"],
                 locale="en-US",
                 extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
             )
         return _context
 
 
-async def fetch_html(url: str) -> str:
-    ctx = await get_context()
+async def fetch_html_js(url: str) -> str:
+    """For pages where content is JS-rendered (showtime section)."""
+    ctx  = await get_context()
     page = await ctx.new_page()
     try:
-        await page.goto(url, wait_until="networkidle", timeout=30_000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+        # wait for showtime section or 5s max
+        try:
+            await page.wait_for_selector("#showtimes, .stub", timeout=5_000)
+        except Exception:
+            pass
         return await page.content()
     finally:
         await page.close()
@@ -69,16 +88,16 @@ async def fetch_html(url: str) -> str:
 # ─── Scraping ────────────────────────────────────────────────────
 
 async def fetch_movies() -> list[dict]:
-    html = await fetch_html(f"{BASE_URL}/movies")
+    html = await fetch_html_static(f"{BASE_URL}/movies")
     soup = BeautifulSoup(html, "html.parser")
     movies = []
     for wrap in soup.select('div[data-testid="poster-preview-wrap"]'):
         link = wrap.select_one('a[href^="/movies/"]')
         if not link:
             continue
-        slug  = link["href"].replace("/movies/", "").strip("/")
-        h3    = wrap.select_one("h3 a")
-        title = h3.get_text(strip=True) if h3 else slug
+        slug   = link["href"].replace("/movies/", "").strip("/")
+        h3     = wrap.select_one("h3 a")
+        title  = h3.get_text(strip=True) if h3 else slug
         badge  = wrap.select_one(".editorial-eyebrow--night")
         status = badge.get_text(strip=True) if badge else "Now Showing"
         genres = [
@@ -95,6 +114,8 @@ def _parse_showtime_page(html: str, halls: list[str]) -> tuple[bool, str]:
     text    = section.get_text(separator="\n", strip=True) if section else ""
     h       = hashlib.sha256(text.encode()).hexdigest()
 
+    if not section or not text:
+        return False, h
     if "Bookings open closer to release" in text:
         return False, h
 
@@ -106,15 +127,11 @@ def _parse_showtime_page(html: str, halls: list[str]) -> tuple[bool, str]:
         open_stubs = [s for s in all_stubs if "stub--closed" not in s.get("class", [])]
         return bool(open_stubs), h
 
-    if not section:
-        return False, h
-
     for branch in section.select("li"):
         h3 = branch.select_one("h3")
         if not h3:
             continue
-        name = h3.get_text(strip=True)
-        if not any(kw.lower() in name.lower() for kw in halls):
+        if not any(kw.lower() in h3.get_text(strip=True).lower() for kw in halls):
             continue
         open_stubs = [
             s for s in branch.select(".stub")
@@ -127,7 +144,7 @@ def _parse_showtime_page(html: str, halls: list[str]) -> tuple[bool, str]:
 
 
 async def fetch_showtime_data(slug: str, halls: list[str]) -> tuple[bool, str]:
-    html = await fetch_html(f"{BASE_URL}/movies/{slug}")
+    html = await fetch_html_js(f"{BASE_URL}/movies/{slug}")
     return _parse_showtime_page(html, halls)
 
 
@@ -136,7 +153,6 @@ def halls_label(halls: list[str]) -> str:
 
 
 def movie_keyboard(movies: list[dict], prefix: str) -> InlineKeyboardMarkup:
-    """2-column inline keyboard of movie titles."""
     buttons = [
         InlineKeyboardButton(m["title"], callback_data=f"{prefix}:{m['slug']}")
         for m in movies
@@ -150,12 +166,11 @@ def movie_keyboard(movies: list[dict], prefix: str) -> InlineKeyboardMarkup:
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎬 *Star Cineplex Bot*\n\n"
-        "Commands:\n"
         "/movies — সব মুভি দেখো\n"
         "/alert — booking alert সেট করো\n"
         "/alerts — active alerts\n"
         "/cancel — alert বন্ধ করো\n"
-        "/check — এখনই status দেখো",
+        "/check `slug` \\[hall\\] — status দেখো",
         parse_mode="Markdown",
     )
 
@@ -168,6 +183,10 @@ async def cmd_movies(update: Update, _: ContextTypes.DEFAULT_TYPE):
         movies = await fetch_movies()
     except Exception as e:
         await msg.edit_text(f"❌ Fetch failed: {e}")
+        return
+
+    if not movies:
+        await msg.edit_text("কোনো মুভি পাওয়া গেল না।")
         return
 
     now  = [m for m in movies if m["status"] == "Now Showing"]
@@ -185,14 +204,9 @@ async def cmd_movies(update: Update, _: ContextTypes.DEFAULT_TYPE):
             g = ", ".join(m["genres"][:2]) or "—"
             lines.append(f"• [{m['title']}]({BASE_URL}/movies/{m['slug']}) — _{g}_")
 
-    if not lines:
-        await msg.edit_text("কোনো মুভি পাওয়া গেল না।")
-        return
-
-    # Quick-alert buttons
     kb = movie_keyboard(movies, "quickalert")
     await msg.edit_text(
-        "\n".join(lines) + "\n\n_নিচের বাটন থেকে alert দাও:_",
+        "\n".join(lines) + "\n\n_নিচ থেকে সরাসরি alert দাও:_",
         parse_mode="Markdown",
         disable_web_page_preview=True,
         reply_markup=kb,
@@ -202,19 +216,21 @@ async def cmd_movies(update: Update, _: ContextTypes.DEFAULT_TYPE):
 # ─── /alert conversation ─────────────────────────────────────────
 
 async def cmd_alert_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # /alert slug [hall...] — direct path
     if ctx.args:
         slug  = ctx.args[0].strip().lower()
         halls = [a.strip() for a in ctx.args[1:]]
         await _do_set_alert(update, ctx, slug, halls)
         return ConversationHandler.END
 
-    # no args → show picker
     msg = await update.message.reply_text("⏳ মুভির লিস্ট আনছি…")
     try:
         movies = await fetch_movies()
     except Exception as e:
         await msg.edit_text(f"❌ {e}")
+        return ConversationHandler.END
+
+    if not movies:
+        await msg.edit_text("মুভি পাওয়া গেল না।")
         return ConversationHandler.END
 
     ctx.user_data["movies"] = movies
@@ -226,15 +242,13 @@ async def cmd_alert_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_alert_pick_movie(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    slug = query.data.split(":", 1)[1]
+    slug  = query.data.split(":", 1)[1]
     ctx.user_data["alert_slug"] = slug
-
     movies = ctx.user_data.get("movies", [])
     title  = next((m["title"] for m in movies if m["slug"] == slug), slug)
-
     await query.edit_message_text(
-        f"*{title}*\n\nকোন হলের জন্য? হলের নাম টাইপ করো (যেমন `shimanto`, `bashundhara`).\n"
-        "অথবা যেকোনো হলের জন্য /skip দাও।",
+        f"*{title}*\n\nকোন হলের জন্য? হলের নাম টাইপ করো (যেমন `shimanto`).\n"
+        "যেকোনো হলের জন্য /skip দাও।",
         parse_mode="Markdown",
     )
     return PICK_HALL
@@ -254,17 +268,17 @@ async def cmd_alert_skip_hall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _do_set_alert(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+    update: Update, _: ContextTypes.DEFAULT_TYPE,
     slug: str, halls: list[str],
 ):
     chat_id = update.effective_chat.id
-    msg_fn  = update.message.reply_text if update.message else update.callback_query.message.reply_text
+    send    = update.message.reply_text if update.message else update.callback_query.message.reply_text
 
-    wait = await msg_fn("⏳ চেক করছি…")
+    wait = await send("⏳ চেক করছি…")
     try:
         is_open, h = await fetch_showtime_data(slug, halls)
     except Exception:
-        await wait.edit_text(f"❌ `{slug}` পাওয়া যায়নি। slug ঠিক আছে?", parse_mode="Markdown")
+        await wait.edit_text(f"❌ `{slug}` পাওয়া যায়নি।", parse_mode="Markdown")
         return
 
     async with alert_lock:
@@ -283,21 +297,10 @@ async def _do_set_alert(
         )
 
 
-# ─── Quick-alert from /movies keyboard ───────────────────────────
-
 async def cb_quickalert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     slug = query.data.split(":", 1)[1]
-    ctx.user_data["alert_slug"] = slug
-
-    movies = []  # we don't have the list here, that's fine
-    await query.message.reply_text(
-        f"*{slug}*\n\nকোন হলের জন্য? হলের নাম লেখো বা /skip দাও।",
-        parse_mode="Markdown",
-    )
-    # inject into conversation state manually — simpler: just call _do_set_alert with []
-    # for quick-alert we default to any hall
     await _do_set_alert(update, ctx, slug, [])
 
 
@@ -311,20 +314,15 @@ async def cmd_alerts(update: Update, _: ContextTypes.DEFAULT_TYPE):
             for slug, data in active_alerts.items()
             if chat_id in data
         }
-
     if not mine:
-        await update.message.reply_text(
-            "কোনো active alert নেই। /alert দিয়ে set করো।"
-        )
+        await update.message.reply_text("কোনো active alert নেই। /alert দিয়ে set করো।")
         return
 
-    buttons = [
-        [InlineKeyboardButton(f"🗑 {slug}", callback_data=f"cancel:{slug}")]
-        for slug in mine
-    ]
-    lines = ["🔔 *Active Alerts*"]
+    lines   = ["🔔 *Active Alerts*"]
+    buttons = []
     for slug, info in mine.items():
         lines.append(f"• `{slug}` — _{halls_label(info['halls'])}_")
+        buttons.append([InlineKeyboardButton(f"🗑 {slug}", callback_data=f"cancel:{slug}")])
 
     await update.message.reply_text(
         "\n".join(lines),
@@ -348,14 +346,8 @@ async def cmd_cancel_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("কোনো active alert নেই।")
         return
 
-    buttons = [
-        [InlineKeyboardButton(slug, callback_data=f"cancel:{slug}")]
-        for slug in mine
-    ]
-    await update.message.reply_text(
-        "কোনটা বন্ধ করবে?",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    buttons = [[InlineKeyboardButton(slug, callback_data=f"cancel:{slug}")] for slug in mine]
+    await update.message.reply_text("কোনটা বন্ধ করবে?", reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def cb_cancel(update: Update, _: ContextTypes.DEFAULT_TYPE):
@@ -368,19 +360,16 @@ async def cb_cancel(update: Update, _: ContextTypes.DEFAULT_TYPE):
 
 async def _do_cancel(update: Update, chat_id: int, slug: str):
     async with alert_lock:
+        removed = False
         if slug in active_alerts and chat_id in active_alerts[slug]:
             del active_alerts[slug][chat_id]
             if not active_alerts[slug]:
                 del active_alerts[slug]
             removed = True
-        else:
-            removed = False
 
     reply = update.message or update.callback_query.message
-    if removed:
-        await reply.reply_text(f"🗑 Alert cancelled: `{slug}`", parse_mode="Markdown")
-    else:
-        await reply.reply_text(f"❓ `{slug}` এর কোনো alert ছিল না।", parse_mode="Markdown")
+    text  = f"🗑 Alert cancelled: `{slug}`" if removed else f"❓ `{slug}` এর কোনো alert ছিল না।"
+    await reply.reply_text(text, parse_mode="Markdown")
 
 
 # ─── /check ──────────────────────────────────────────────────────
@@ -429,7 +418,7 @@ async def polling_loop(app: Application):
 
         for slug, chats in snapshot.items():
             hall_groups: dict[str, list[int]] = {}
-            hall_map:   dict[int, list[str]] = {}
+            hall_map:   dict[int, list[str]]  = {}
             for cid, info in chats.items():
                 key = "|".join(sorted(info["halls"]))
                 hall_groups.setdefault(key, []).append(cid)
@@ -455,7 +444,6 @@ async def polling_loop(app: Application):
                                 to_notify.append((cid, hall_map[cid]))
 
                 for cid, halls_for_cid in to_notify:
-                    movies = ctx.user_data.get("movies", [])
                     try:
                         await app.bot.send_message(
                             chat_id=cid,
@@ -485,11 +473,13 @@ class PingHandler(BaseHTTPRequestHandler):
 # ─── Main ─────────────────────────────────────────────────────────
 
 def main():
-    threading.Thread(target=lambda: HTTPServer(("0.0.0.0", 10000), PingHandler).serve_forever(), daemon=True).start()
+    threading.Thread(
+        target=lambda: HTTPServer(("0.0.0.0", 10000), PingHandler).serve_forever(),
+        daemon=True,
+    ).start()
 
     app = Application.builder().token(TG_TOKEN).build()
 
-    # /alert conversation
     alert_conv = ConversationHandler(
         entry_points=[CommandHandler("alert", cmd_alert_start)],
         states={
@@ -510,8 +500,6 @@ def main():
     app.add_handler(CommandHandler("alerts",  cmd_alerts))
     app.add_handler(CommandHandler("cancel",  cmd_cancel_cmd))
     app.add_handler(CommandHandler("check",   cmd_check))
-
-    # inline keyboard callbacks
     app.add_handler(CallbackQueryHandler(cb_quickalert, pattern=r"^quickalert:"))
     app.add_handler(CallbackQueryHandler(cb_cancel,     pattern=r"^cancel:"))
 
