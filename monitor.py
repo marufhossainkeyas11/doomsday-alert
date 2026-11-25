@@ -1,42 +1,73 @@
 import os
 import asyncio
 import hashlib
-import httpx
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, Browser, BrowserContext
 from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, ContextTypes, MessageHandler, filters
+    Application, CommandHandler, ContextTypes
 )
 
 # --- CONFIG ---
 TG_TOKEN = os.environ["TG_TOKEN"]
 BASE_URL  = "https://starcineplex.com"
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/125.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
 CHECK_EVERY = 30  # seconds
 
 # slug → {chat_id → last_hash}
 active_alerts: dict[str, dict[int, str]] = {}
 alert_lock = asyncio.Lock()
+
+# global browser + context (reused across all fetches)
+_browser: Browser | None = None
+_context: BrowserContext | None = None
+_pw_lock = asyncio.Lock()
 # --- END CONFIG ---
 
 
-# ─── Scraping helpers ───────────────────────────────────────────
+# ─── Playwright helpers ──────────────────────────────────────────
 
-async def fetch_movies(client: httpx.AsyncClient) -> list[dict]:
-    """Fetch all movies from /movies page."""
-    r = await client.get(f"{BASE_URL}/movies", headers=HEADERS,
-                         follow_redirects=True, timeout=15)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+async def get_context() -> BrowserContext:
+    global _browser, _context
+    async with _pw_lock:
+        if _context is None:
+            pw = await async_playwright().start()
+            _browser = await pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
+            )
+            _context = await _browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            )
+        return _context
+
+
+async def fetch_html(url: str) -> str:
+    ctx = await get_context()
+    page = await ctx.new_page()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+        await page.wait_for_timeout(1500)   # let JS render
+        return await page.content()
+    finally:
+        await page.close()
+
+
+# ─── Scraping helpers ────────────────────────────────────────────
+
+async def fetch_movies() -> list[dict]:
+    html = await fetch_html(f"{BASE_URL}/movies")
+    soup = BeautifulSoup(html, "html.parser")
     movies = []
     for article in soup.select("article.group"):
         link = article.select_one("a[href^='/movies/']")
@@ -47,27 +78,14 @@ async def fetch_movies(client: httpx.AsyncClient) -> list[dict]:
         title = title.get_text(strip=True) if title else slug
         badge = article.select_one(".editorial-eyebrow--night")
         status = badge.get_text(strip=True) if badge else "Now Showing"
-        genres = [g.get_text(strip=True)
-                  for g in article.select("[data-genre]")]
-        movies.append({
-            "slug": slug,
-            "title": title,
-            "status": status,
-            "genres": genres,
-        })
+        genres = [g.get_text(strip=True) for g in article.select("[data-genre]")]
+        movies.append({"slug": slug, "title": title, "status": status, "genres": genres})
     return movies
 
 
-async def fetch_showtime_hash(client: httpx.AsyncClient, slug: str) -> tuple[bool, str]:
-    """
-    Returns (booking_open, section_hash) for a movie page.
-    booking_open = True when showtimes/stubs are present.
-    """
-    url = f"{BASE_URL}/movies/{slug}"
-    r = await client.get(url, headers=HEADERS,
-                         follow_redirects=True, timeout=15)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+async def fetch_showtime_hash(slug: str) -> tuple[bool, str]:
+    html = await fetch_html(f"{BASE_URL}/movies/{slug}")
+    soup = BeautifulSoup(html, "html.parser")
     section = soup.select_one("#showtimes")
     text = section.get_text(separator="\n", strip=True) if section else ""
     closed = "Bookings open closer to release" in text
@@ -92,21 +110,19 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_movies(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    async with httpx.AsyncClient() as client:
-        try:
-            movies = await fetch_movies(client)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Fetch failed: {e}")
-            return
+    try:
+        movies = await fetch_movies()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Fetch failed: {e}")
+        return
 
-    now = [m for m in movies if m["status"] == "Now Showing"]
+    now  = [m for m in movies if m["status"] == "Now Showing"]
     soon = [m for m in movies if m["status"] != "Now Showing"]
 
     lines = ["🎬 *Now Showing*"]
     for m in now:
         g = ", ".join(m["genres"][:2]) or "—"
         lines.append(f"• [{m['title']}]({BASE_URL}/movies/{m['slug']}) _{g}_")
-
     if soon:
         lines.append("\n🔜 *Coming Soon*")
         for m in soon:
@@ -128,15 +144,13 @@ async def cmd_alert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     slug = ctx.args[0].strip().lower()
     chat_id = update.effective_chat.id
 
-    # verify slug exists
-    async with httpx.AsyncClient() as client:
-        try:
-            is_open, h = await fetch_showtime_hash(client, slug)
-        except Exception:
-            await update.message.reply_text(
-                f"❌ `{slug}` পাওয়া যায়নি। slug টা ঠিক আছে?",
-                parse_mode="Markdown")
-            return
+    try:
+        is_open, h = await fetch_showtime_hash(slug)
+    except Exception:
+        await update.message.reply_text(
+            f"❌ `{slug}` পাওয়া যায়নি। slug টা ঠিক আছে?",
+            parse_mode="Markdown")
+        return
 
     async with alert_lock:
         if slug not in active_alerts:
@@ -145,37 +159,33 @@ async def cmd_alert(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if is_open:
         await update.message.reply_text(
-            f"✅ *{slug}* — এখনই booking open!\n"
-            f"👉 {BASE_URL}/movies/{slug}",
-            parse_mode="Markdown"
-        )
+            f"✅ *{slug}* — এখনই booking open!\n👉 {BASE_URL}/movies/{slug}",
+            parse_mode="Markdown")
     else:
         await update.message.reply_text(
-            f"🔔 Alert set: *{slug}*\n"
-            f"Booking open হলেই জানাবো।",
-            parse_mode="Markdown"
-        )
+            f"🔔 Alert set: *{slug}*\nBooking open হলেই জানাবো।",
+            parse_mode="Markdown")
 
 
 async def cmd_alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     async with alert_lock:
-        mine = [slug for slug, chats in active_alerts.items()
-                if chat_id in chats]
+        mine = [slug for slug, chats in active_alerts.items() if chat_id in chats]
 
     if not mine:
-        await update.message.reply_text("কোনো active alert নেই। `/alert slug` দিয়ে set করো.", parse_mode="Markdown")
+        await update.message.reply_text(
+            "কোনো active alert নেই। `/alert slug` দিয়ে set করো.",
+            parse_mode="Markdown")
         return
 
-    lines = ["🔔 *Active Alerts*"]
-    for slug in mine:
-        lines.append(f"• `{slug}`")
+    lines = ["🔔 *Active Alerts*"] + [f"• `{s}`" for s in mine]
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
-        await update.message.reply_text("Usage: `/cancel avengers-doomsday`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Usage: `/cancel avengers-doomsday`", parse_mode="Markdown")
         return
 
     slug = ctx.args[0].strip().lower()
@@ -197,16 +207,16 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
-        await update.message.reply_text("Usage: `/check avengers-doomsday`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "Usage: `/check avengers-doomsday`", parse_mode="Markdown")
         return
 
     slug = ctx.args[0].strip().lower()
-    async with httpx.AsyncClient() as client:
-        try:
-            is_open, _ = await fetch_showtime_hash(client, slug)
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error: {e}")
-            return
+    try:
+        is_open, _ = await fetch_showtime_hash(slug)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {e}")
+        return
 
     if is_open:
         await update.message.reply_text(
@@ -214,50 +224,47 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
     else:
         await update.message.reply_text(
-            f"⏳ *{slug}* — এখনো open হয়নি।",
-            parse_mode="Markdown")
+            f"⏳ *{slug}* — এখনো open হয়নি।", parse_mode="Markdown")
 
 
 # ─── Background polling loop ─────────────────────────────────────
 
 async def polling_loop(app: Application):
-    """Check all active alerts every CHECK_EVERY seconds."""
-    await asyncio.sleep(10)  # let bot start first
-    async with httpx.AsyncClient() as client:
-        while True:
-            await asyncio.sleep(CHECK_EVERY)
+    await asyncio.sleep(10)
+    while True:
+        await asyncio.sleep(CHECK_EVERY)
+        async with alert_lock:
+            slugs = dict(active_alerts)
+
+        for slug, chats in slugs.items():
+            try:
+                is_open, current_hash = await fetch_showtime_hash(slug)
+            except Exception:
+                continue
+
+            to_notify = []
             async with alert_lock:
-                slugs = dict(active_alerts)  # snapshot
-
-            for slug, chats in slugs.items():
-                try:
-                    is_open, current_hash = await fetch_showtime_hash(client, slug)
-                except Exception:
+                if slug not in active_alerts:
                     continue
+                for chat_id, last_hash in list(active_alerts[slug].items()):
+                    if current_hash != last_hash:
+                        active_alerts[slug][chat_id] = current_hash
+                        if is_open:
+                            to_notify.append(chat_id)
 
-                to_notify = []
-                async with alert_lock:
-                    if slug not in active_alerts:
-                        continue
-                    for chat_id, last_hash in list(active_alerts[slug].items()):
-                        if current_hash != last_hash:
-                            active_alerts[slug][chat_id] = current_hash
-                            if is_open:
-                                to_notify.append(chat_id)
-
-                for chat_id in to_notify:
-                    try:
-                        await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"🎟 *BOOKING OPEN!*\n\n"
-                                f"*{slug}* এর টিকেট এখন available!\n\n"
-                                f"👉 {BASE_URL}/movies/{slug}"
-                            ),
-                            parse_mode="Markdown"
-                        )
-                    except Exception:
-                        pass
+            for chat_id in to_notify:
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"🎟 *BOOKING OPEN!*\n\n"
+                            f"*{slug}* এর টিকেট এখন available!\n\n"
+                            f"👉 {BASE_URL}/movies/{slug}"
+                        ),
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
 
 
 # ─── HTTP ping server (Render free tier) ─────────────────────────
@@ -287,9 +294,6 @@ def main():
     app.add_handler(CommandHandler("alerts",  cmd_alerts))
     app.add_handler(CommandHandler("cancel",  cmd_cancel))
     app.add_handler(CommandHandler("check",   cmd_check))
-
-    # start polling loop as background task
-    app.job_queue  # just ensure initialized
 
     async def post_init(app: Application):
         asyncio.create_task(polling_loop(app))
