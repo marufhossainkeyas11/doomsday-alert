@@ -1,3 +1,4 @@
+import os
 import asyncio
 import hashlib
 import httpx
@@ -6,8 +7,8 @@ from bs4 import BeautifulSoup
 # --- CONFIG ---
 TICKET_URL   = "https://starcineplex.com/movies/avengers-doomsday"
 CHECK_EVERY  = 10          # seconds
-TG_TOKEN     = "FILL:BOT_TOKEN"
-TG_CHAT_ID   = "FILL:CHAT_ID"
+TG_TOKEN   = os.environ["TG_TOKEN"]
+TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 
 # এই text থাকলে এখনো open হয়নি
 CLOSED_TEXT  = "Bookings open closer to release"
