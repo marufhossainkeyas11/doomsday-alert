@@ -29,16 +29,34 @@ PICK_MOVIE, PICK_HALL = range(2)
 # ─────────────────────────────────────────────────────────────────
 
 
+def _find_chromium() -> str:
+    import shutil
+    for candidate in (
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        shutil.which("chromium-browser"),
+        shutil.which("chromium"),
+        shutil.which("google-chrome"),
+    ):
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    raise RuntimeError("Chrome/Chromium binary not found")
+
+
 async def get_browser() -> uc.Browser:
     global _browser
     async with _browser_lock:
         if _browser is None:
             _browser = await uc.start(
                 headless=True,
+                browser_executable_path=_find_chromium(),
                 browser_args=[
                     "--no-sandbox",
                     "--disable-setuid-sandbox",
                     "--disable-dev-shm-usage",
+                    "--single-process",
                 ],
             )
         return _browser
