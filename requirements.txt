@@ -1,3 +1,3 @@
 python-telegram-bot==21.9
-curl-cffi>=0.7.0
+nodriver
 beautifulsoup4==4.12.3
