@@ -3,11 +3,9 @@ import asyncio
 import hashlib
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from playwright_stealth import stealth_async
 
-import httpx
+from curl_cffi.requests import AsyncSession
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, Browser, BrowserContext
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -18,15 +16,12 @@ from telegram.ext import (
 TG_TOKEN    = os.environ["TG_TOKEN"]
 BASE_URL    = "https://starcineplex.com"
 CHECK_EVERY = 60
+IMPERSONATE = "chrome131"
 
 DEFAULT_HALLS: list[str] = []
 
 active_alerts: dict[str, dict[int, dict]] = {}
 alert_lock = asyncio.Lock()
-
-_browser: Browser | None = None
-_context: BrowserContext | None = None
-_pw_lock  = asyncio.Lock()
 
 PICK_MOVIE, PICK_HALL = range(2)
 
@@ -37,62 +32,28 @@ HEADERS = {
         "Chrome/131.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
 # ─────────────────────────────────────────────────────────────────
 
 
-# ─── HTTP (movies page — SSR, no JS needed) ──────────────────────
-
-async def fetch_html_static(url: str) -> str:
-    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=20) as client:
-        r = await client.get(url)
+async def fetch_html(url: str) -> str:
+    async with AsyncSession(impersonate=IMPERSONATE) as session:
+        r = await session.get(url, headers=HEADERS, timeout=25)
         r.raise_for_status()
         return r.text
-
-
-# ─── Playwright (showtime page — JS-rendered) ────────────────────
-
-async def get_context() -> BrowserContext:
-    global _browser, _context
-    async with _pw_lock:
-        if _context is None:
-            pw = await async_playwright().start()
-            _browser = await pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox"],
-            )
-            _context = await _browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent=HEADERS["User-Agent"],
-                locale="en-US",
-                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
-            )
-        return _context
-
-
-
-async def fetch_html_js(url: str) -> str:
-    ctx  = await get_context()
-    page = await ctx.new_page()
-    await stealth_async(page)  # এই line যোগ করো
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
-        try:
-            await page.wait_for_selector(
-                'div[data-testid="poster-preview-wrap"], #showtimes, .stub',
-                timeout=8_000,
-            )
-        except Exception:
-            pass
-        return await page.content()
-    finally:
-        await page.close()
 
 
 # ─── Scraping ────────────────────────────────────────────────────
 
 async def fetch_movies() -> list[dict]:
-    html = await fetch_html_js(f"{BASE_URL}/movies")
+    html = await fetch_html(f"{BASE_URL}/movies")
     soup = BeautifulSoup(html, "html.parser")
     movies = []
     for wrap in soup.select('div[data-testid="poster-preview-wrap"]'):
@@ -111,27 +72,19 @@ async def fetch_movies() -> list[dict]:
         movies.append({"slug": slug, "title": title, "status": status, "genres": genres})
     return movies
 
+
 async def cmd_debug(update: Update, _: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ fetching...")
     try:
-        html = await fetch_html_js(f"{BASE_URL}/movies")
+        html = await fetch_html(f"{BASE_URL}/movies")
         soup = BeautifulSoup(html, "html.parser")
-        
-        # check 1: poster wraps
-        wraps = soup.select('div[data-testid="poster-preview-wrap"]')
-        
-        # check 2: any articles
+
+        wraps    = soup.select('div[data-testid="poster-preview-wrap"]')
         articles = soup.find_all("article")
-        
-        # check 3: any movie links
-        links = soup.select('a[href^="/movies/"]')
-        
-        # check 4: page title
-        title = soup.select_one("title")
-        
-        # check 5: html length
+        links    = soup.select('a[href^="/movies/"]')
+        title    = soup.select_one("title")
         html_len = len(html)
-        
+
         info = (
             f"HTML size: {html_len} bytes\n"
             f"Title: {title.get_text() if title else 'none'}\n"
@@ -144,6 +97,7 @@ async def cmd_debug(update: Update, _: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"```\n{info}\n```", parse_mode="Markdown")
     except Exception as e:
         await msg.edit_text(f"❌ {e}")
+
 
 def _parse_showtime_page(html: str, halls: list[str]) -> tuple[bool, str]:
     soup    = BeautifulSoup(html, "html.parser")
@@ -181,7 +135,7 @@ def _parse_showtime_page(html: str, halls: list[str]) -> tuple[bool, str]:
 
 
 async def fetch_showtime_data(slug: str, halls: list[str]) -> tuple[bool, str]:
-    html = await fetch_html_js(f"{BASE_URL}/movies/{slug}")
+    html = await fetch_html(f"{BASE_URL}/movies/{slug}")
     return _parse_showtime_page(html, halls)
 
 
@@ -537,10 +491,10 @@ def main():
     app.add_handler(CommandHandler("alerts",  cmd_alerts))
     app.add_handler(CommandHandler("cancel",  cmd_cancel_cmd))
     app.add_handler(CommandHandler("check",   cmd_check))
-    app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CommandHandler("debug",   cmd_debug))
     app.add_handler(CallbackQueryHandler(cb_quickalert, pattern=r"^quickalert:"))
     app.add_handler(CallbackQueryHandler(cb_cancel,     pattern=r"^cancel:"))
-    
+
     async def post_init(application: Application):
         asyncio.create_task(polling_loop(application))
 
