@@ -88,7 +88,7 @@ async def fetch_html_js(url: str) -> str:
 # ─── Scraping ────────────────────────────────────────────────────
 
 async def fetch_movies() -> list[dict]:
-    html = await fetch_html_static(f"{BASE_URL}/movies")
+    html = await fetch_html_js(f"{BASE_URL}/movies")
     soup = BeautifulSoup(html, "html.parser")
     movies = []
     for wrap in soup.select('div[data-testid="poster-preview-wrap"]'):
@@ -106,7 +106,6 @@ async def fetch_movies() -> list[dict]:
         ]
         movies.append({"slug": slug, "title": title, "status": status, "genres": genres})
     return movies
-
 
 def _parse_showtime_page(html: str, halls: list[str]) -> tuple[bool, str]:
     soup    = BeautifulSoup(html, "html.parser")
